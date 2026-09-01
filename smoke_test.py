@@ -130,6 +130,8 @@ with TestClient(main.app) as client:
         desc = sc.get("description", "")
         check("description carries text + reporter",
               "נזילה" in desc and "דנה לוי" in desc, desc)
+        check("maintenance classification included",
+              "סיווג: maintenance_request" in desc and "נזילה" in desc, desc)
         check("attribution line comes first (anti-spoof)",
               desc.startswith("— נפתח אוטומטית"), desc[:60])
     check("general key used for reads",

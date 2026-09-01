@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from config import get_settings
 from models import WebhookPayload, WhatsAppMessage
+from message_classifier import classify_message
 from oxs_service import OxsClient, OxsError
 from phone_utils import normalize_phone
 
@@ -191,6 +192,14 @@ async def receive_webhook(request: Request) -> dict:
                 message.type, message.id,
             )
             continue
+        classification = classify_message(text)
+        if classification.category != "maintenance_request":
+            log.info(
+                "event=message.skipped reason=no_maintenance_keyword category=%s "
+                "message_id=%s",
+                classification.category, message.id,
+            )
+            continue
         if _sender_over_limit(message.from_number):
             # Stays marked as seen on purpose — a flood shouldn't come back.
             log.warning(
@@ -249,9 +258,13 @@ async def process_message(
         return
 
     reporter = re.sub(r"\s+", " ", match.tenant_name or sender_name or sender).strip()[:100]
+    classification = classify_message(text)
+    matched_terms = ", ".join(classification.matched_terms) or "אין מילות מפתח"
     # System attribution goes FIRST so a crafted message body can't spoof it.
     description = (
         f"— נפתח אוטומטית מהודעת וואטסאפ מאת {reporter} ({_display_phone(sender)})\n"
+        f"סיווג: {classification.category}\n"
+        f"מילות מפתח: {matched_terms}\n"
         "----------------------------------------\n"
         f"{text}"
     )
@@ -271,8 +284,10 @@ async def process_message(
         )
         return
     log.info(
-        "event=flow.done message_id=%s building=%r apartment_id=%s service_call_id=%s",
-        message.id, match.building_name, match.apartment_id, call_id,
+        "event=flow.done message_id=%s category=%s matched_terms=%s building=%r "
+        "apartment_id=%s service_call_id=%s",
+        message.id, classification.category, matched_terms, match.building_name,
+        match.apartment_id, call_id,
     )
 
 

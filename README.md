@@ -40,6 +40,15 @@ them** (anyone could forge them otherwise). For local experiments only, set
 
 Mocked end-to-end test (no real OXS/Meta needed): `.venv\Scripts\python smoke_test.py`
 
+## Message classification
+
+Only messages containing one or more configured Hebrew maintenance terms are
+queued, matched to an OXS tenant, and sent as service calls. They are labeled
+`maintenance_request`. Other messages, such as greetings or conversation, are
+acknowledged by Meta but skipped before any OXS API request and labeled
+`general_message` in the application logs. The terms are maintained in
+`message_classifier.py`.
+
 ## Deploy to Azure ($0/month)
 
 ```powershell
