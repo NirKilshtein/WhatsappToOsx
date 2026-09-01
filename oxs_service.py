@@ -394,11 +394,11 @@ class OxsClient:
             "POST", "/service-calls", self._service_calls_key,
             json_body=body, idempotent=False,
         )
-        call_id = payload.get("id") or payload.get("_id") if isinstance(payload, dict) else None
+        call_id = payload.get("id", payload.get("_id")) if isinstance(payload, dict) else None
         if call_id is None and isinstance(payload, dict):
             nested = payload.get("data")
             if isinstance(nested, dict):
-                call_id = nested.get("id") or nested.get("_id")
+                call_id = nested.get("id", nested.get("_id"))
         log.info(
             "event=oxs.service_call_created building_id=%s apartment_id=%s call_id=%s",
             building_id, apartment_id, call_id,

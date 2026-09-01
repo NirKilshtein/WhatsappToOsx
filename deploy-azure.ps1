@@ -90,6 +90,10 @@ if ($names -notcontains "SCM_DO_BUILD_DURING_DEPLOYMENT") { $toSet += "SCM_DO_BU
 if ($names -notcontains "OXS_GENERAL_API_KEY")       { $toSet += "OXS_GENERAL_API_KEY=CHANGE_ME" }
 if ($names -notcontains "OXS_SERVICE_CALLS_API_KEY") { $toSet += "OXS_SERVICE_CALLS_API_KEY=CHANGE_ME" }
 if ($names -notcontains "META_APP_SECRET")           { $toSet += "META_APP_SECRET=CHANGE_ME" }
+if ($names -notcontains "WHATSAPP_PROVIDER")         { $toSet += "WHATSAPP_PROVIDER=meta" }
+if ($names -notcontains "GREENAPI_API_KEY")          { $toSet += "GREENAPI_API_KEY=CHANGE_ME" }
+if ($names -notcontains "GREENAPI_INSTANCE_ID")      { $toSet += "GREENAPI_INSTANCE_ID=CHANGE_ME" }
+if ($names -notcontains "GREENAPI_WEBHOOK_TOKEN")    { $toSet += "GREENAPI_WEBHOOK_TOKEN=CHANGE_ME" }
 if ($names -notcontains "META_VERIFY_TOKEN") {
     $token = -join ((48..57) + (97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_})
     $toSet += "META_VERIFY_TOKEN=$token"
@@ -104,7 +108,7 @@ if ($toSet.Count -gt 0) {
 # the SCM container briefly unavailable.
 $zip = Join-Path $PSScriptRoot "app.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
-$files = @("main.py", "oxs_service.py", "models.py", "phone_utils.py", "config.py", "requirements.txt") |
+$files = @("main.py", "oxs_service.py", "models.py", "phone_utils.py", "config.py", "message_classifier.py", "requirements.txt") |
     ForEach-Object { Join-Path $PSScriptRoot $_ }
 Compress-Archive -Path $files -DestinationPath $zip
 

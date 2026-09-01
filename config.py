@@ -37,11 +37,14 @@ def _int_env(name: str, default: int) -> int:
 
 class Settings:
     def __init__(self) -> None:
-        # --- WhatsApp Provider Selection ---
-        # Choose between "meta" (Meta Cloud API) or "greenapi" (Green API)
+        # --- WhatsApp provider selection ---
+        # "meta" (Meta Cloud API webhooks) or "greenapi" (Green API webhooks).
         self.whatsapp_provider: str = os.getenv("WHATSAPP_PROVIDER", "meta").lower()
         if self.whatsapp_provider not in ("meta", "greenapi"):
-            _log.warning("event=config.bad_provider value=%r using_default=meta", self.whatsapp_provider)
+            _log.warning(
+                "event=config.bad_provider value=%r using_default=meta",
+                self.whatsapp_provider,
+            )
             self.whatsapp_provider = "meta"
 
         # --- OXS Management API ---
@@ -65,10 +68,18 @@ class Settings:
         ).lower() in ("1", "true", "yes")
 
         # --- Green API webhook ---
-        # API key for authenticating Green API webhooks
+        # Naming kept compatible with the WhatsappToOsx setup, where
+        # GREENAPI_API_KEY holds the NUMERIC idInstance and GREENAPI_INSTANCE_ID
+        # holds the long apiTokenInstance (swapped relative to Green API's own
+        # docs). Inbound processing only needs the numeric instance id, so
+        # greenapi_numeric_instance_id() detects it from whichever is numeric.
         self.greenapi_api_key: str = _secret_env("GREENAPI_API_KEY")
-        # Instance ID for Green API
         self.greenapi_instance_id: str = _secret_env("GREENAPI_INSTANCE_ID")
+        # Shared secret: set the instance's webhookUrlToken to the same value
+        # (Green API then sends it in the Authorization header). Without it the
+        # app ACKs webhooks but refuses to process them (fail closed), unless
+        # ALLOW_UNSIGNED_WEBHOOKS=true.
+        self.greenapi_webhook_token: str = _secret_env("GREENAPI_WEBHOOK_TOKEN")
 
         # --- Behaviour tuning ---
         # Client-side ceiling below the documented OXS limit of 60 req/min.
@@ -88,19 +99,26 @@ class Settings:
             missing.append("OXS_GENERAL_API_KEY")
         if not self.oxs_service_calls_key:
             missing.append("OXS_SERVICE_CALLS_API_KEY")
-        
         if self.whatsapp_provider == "meta":
             if not self.meta_verify_token:
                 missing.append("META_VERIFY_TOKEN")
             if not self.meta_app_secret and not self.allow_unsigned_webhooks:
                 missing.append("META_APP_SECRET")
-        elif self.whatsapp_provider == "greenapi":
+        else:  # greenapi
             if not self.greenapi_api_key:
                 missing.append("GREENAPI_API_KEY")
             if not self.greenapi_instance_id:
                 missing.append("GREENAPI_INSTANCE_ID")
-        
+            if not self.greenapi_webhook_token and not self.allow_unsigned_webhooks:
+                missing.append("GREENAPI_WEBHOOK_TOKEN")
         return missing
+
+    def greenapi_numeric_instance_id(self) -> str:
+        """The numeric Green API idInstance, wherever it was configured."""
+        for value in (self.greenapi_instance_id, self.greenapi_api_key):
+            if value.isdigit():
+                return value
+        return ""
 
 
 @lru_cache

@@ -1,18 +1,38 @@
-"""End-to-end smoke test with a mocked OXS API. Run: python smoke_test.py"""
+"""End-to-end smoke test with a mocked OXS API. Run: python smoke_test.py
+
+Runs the Meta-provider suite, then re-runs itself in a subprocess with
+SMOKE_PROVIDER=greenapi for the Green API suite (provider selection happens at
+import time, so each provider needs a fresh process).
+"""
 
 import hashlib
 import hmac
 import json
 import os
+import subprocess
+import sys
 import time
 from collections import Counter
+
+PROVIDER = os.getenv("SMOKE_PROVIDER", "meta")
 
 os.environ.update(
     OXS_GENERAL_API_KEY="general-key-test",
     OXS_SERVICE_CALLS_API_KEY="service-key-test",
-    META_VERIFY_TOKEN="verify-token-test",
-    META_APP_SECRET="app-secret-test",
 )
+if PROVIDER == "meta":
+    os.environ.update(
+        WHATSAPP_PROVIDER="meta",
+        META_VERIFY_TOKEN="verify-token-test",
+        META_APP_SECRET="app-secret-test",
+    )
+else:
+    os.environ.update(
+        WHATSAPP_PROVIDER="greenapi",
+        GREENAPI_API_KEY="710000000042",        # numeric idInstance (WhatsappToOsx naming)
+        GREENAPI_INSTANCE_ID="token-test-abc",  # apiTokenInstance (WhatsappToOsx naming)
+        GREENAPI_WEBHOOK_TOKEN="hook-token-test",
+    )
 
 import httpx
 from fastapi.testclient import TestClient
@@ -64,12 +84,39 @@ def wa_payload(message_id: str, text: str, sender: str = "972501234567") -> byte
     }).encode()
 
 
+def green_payload(
+    message_id: str,
+    text: str,
+    sender: str = "972501234567",
+    type_webhook: str = "incomingMessageReceived",
+    instance: int = 710000000042,
+    extended: bool = False,
+) -> bytes:
+    if extended:
+        message_data = {"typeMessage": "extendedTextMessage",
+                        "extendedTextMessageData": {"text": text}}
+    else:
+        message_data = {"typeMessage": "textMessage",
+                        "textMessageData": {"textMessage": text}}
+    return json.dumps({
+        "typeWebhook": type_webhook,
+        "instanceData": {"idInstance": instance, "wid": "972544446045@c.us",
+                         "typeInstance": "whatsapp"},
+        "timestamp": 1725000000,
+        "idMessage": message_id,
+        "senderData": {"chatId": f"{sender}@c.us", "sender": f"{sender}@c.us",
+                       "chatName": "Dana", "senderName": "Dana",
+                       "senderContactName": "דנה"},
+        "messageData": message_data,
+    }).encode()
+
+
 failures: list[str] = []
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     status = "PASS" if cond else "FAIL"
-    print(f"[{status}] {name}" + (f" — {detail}" if detail and not cond else ""))
+    print(f"[{status}] ({PROVIDER}) {name}" + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         failures.append(name)
 
@@ -88,16 +135,7 @@ def queue_drained() -> bool:
     return main.app.state.queue._unfinished_tasks == 0  # noqa: SLF001
 
 
-with TestClient(main.app) as client:
-    # Swap the real OXS transport for the mock.
-    main.app.state.oxs._http = httpx.AsyncClient(
-        base_url="https://api.oxs.co.il/api/external/v1",
-        transport=httpx.MockTransport(oxs_mock),
-    )
-
-    r = client.get("/health")
-    check("health ok + configured", r.status_code == 200 and r.json()["configured"] is True, r.text)
-
+def run_meta_suite(client: TestClient) -> None:
     r = client.get("/webhook", params={
         "hub.mode": "subscribe", "hub.verify_token": "verify-token-test",
         "hub.challenge": "12345"})
@@ -130,10 +168,10 @@ with TestClient(main.app) as client:
         desc = sc.get("description", "")
         check("description carries text + reporter",
               "נזילה" in desc and "דנה לוי" in desc, desc)
-        check("maintenance classification included",
-              "סיווג: maintenance_request" in desc and "נזילה" in desc, desc)
         check("attribution line comes first (anti-spoof)",
               desc.startswith("— נפתח אוטומטית"), desc[:60])
+        check("description carries classification",
+              "סיווג: maintenance_request" in desc and "נזילה" in desc, desc)
     check("general key used for reads",
           seen_keys.get("/api/external/v1/buildings") == "general-key-test", str(seen_keys))
     check("service key used for create",
@@ -158,14 +196,20 @@ with TestClient(main.app) as client:
         check("long text truncated with marker",
               "[קוצר]" in desc3 and len(desc3) < 1800, f"len={len(desc3)}")
 
-    unknown = wa_payload("wamid.004", "שלום", sender="972539999999")
+    non_maint = wa_payload("wamid.006", "שלום מה נשמע", sender="972501234567")
+    r = client.post("/webhook", content=non_maint, headers={"X-Hub-Signature-256": sign(non_maint)})
+    check("non-maintenance text skipped by classifier",
+          r.status_code == 200 and r.json()["accepted"] == 0
+          and len(captured_service_calls) == 3, r.text)
+
+    unknown = wa_payload("wamid.004", "יש תקלה במעלית", sender="972539999999")
     r = client.post("/webhook", content=unknown, headers={"X-Hub-Signature-256": sign(unknown)})
     wait_until(queue_drained)
     check("unknown sender: accepted, no service call",
           r.status_code == 200 and len(captured_service_calls) == 3, r.text)
 
     counts_before = dict(call_counts)
-    unknown2 = wa_payload("wamid.005", "עוד הודעה", sender="972539999999")
+    unknown2 = wa_payload("wamid.005", "עוד תקלה בשער", sender="972539999999")
     r = client.post("/webhook", content=unknown2, headers={"X-Hub-Signature-256": sign(unknown2)})
     wait_until(queue_drained)
     check("unknown sender negative-cached (no extra OXS calls)",
@@ -194,8 +238,89 @@ with TestClient(main.app) as client:
     r = client.post("/webhook", content=big, headers={"X-Hub-Signature-256": sign(big)})
     check("oversized body -> 413", r.status_code == 413, str(r.status_code))
 
+
+def run_greenapi_suite(client: TestClient) -> None:
+    auth = {"Authorization": "Bearer hook-token-test"}
+
+    r = client.get("/webhook")
+    check("GET /webhook returns OK (no handshake)",
+          r.status_code == 200 and r.text == "OK", r.text)
+
+    body = green_payload("green.001", "יש נזילה בחניון")
+    r = client.post("/webhook", content=body)
+    check("missing Authorization -> 403 (token configured, fail closed)",
+          r.status_code == 403, str(r.status_code))
+
+    r = client.post("/webhook", content=body, headers={"Authorization": "Bearer wrong"})
+    check("wrong webhook token -> 403", r.status_code == 403, str(r.status_code))
+
+    r = client.post("/webhook", content=body, headers=auth)
+    check("valid message accepted", r.status_code == 200 and r.json()["accepted"] == 1, r.text)
+    check("service call created (async worker)",
+          wait_until(lambda: len(captured_service_calls) == 1), str(captured_service_calls))
+    if captured_service_calls:
+        desc = captured_service_calls[0].get("description", "")
+        check("description carries text + reporter (contact name)",
+              "נזילה" in desc and "דנה לוי" in desc, desc)
+        check("description carries classification",
+              "סיווג: maintenance_request" in desc, desc)
+
+    r = client.post("/webhook", content=body, headers=auth)
+    check("duplicate message deduped",
+          r.json()["accepted"] == 0 and len(captured_service_calls) == 1, r.text)
+
+    ext = green_payload("green.002", "המעלית תקועה בקומה 3", extended=True)
+    r = client.post("/webhook", content=ext, headers={"Authorization": "hook-token-test"})
+    check("extendedTextMessage + raw Authorization header accepted",
+          r.status_code == 200 and r.json()["accepted"] == 1
+          and wait_until(lambda: len(captured_service_calls) == 2), r.text)
+
+    status_event = green_payload("green.003", "ignored", type_webhook="stateInstanceChanged")
+    r = client.post("/webhook", content=status_event, headers=auth)
+    check("non-message webhook type ignored",
+          r.status_code == 200 and r.json()["accepted"] == 0, r.text)
+
+    non_maint = green_payload("green.004", "שלום מה נשמע")
+    r = client.post("/webhook", content=non_maint, headers=auth)
+    check("non-maintenance text skipped by classifier",
+          r.status_code == 200 and r.json()["accepted"] == 0
+          and len(captured_service_calls) == 2, r.text)
+
+    wrong_instance = green_payload("green.005", "יש נזילה", instance=999999999999)
+    r = client.post("/webhook", content=wrong_instance, headers=auth)
+    check("wrong idInstance ignored",
+          r.status_code == 200 and r.json().get("status") == "ignored", r.text)
+
+    garbage = b'{"not": "a real payload"'
+    r = client.post("/webhook", content=garbage, headers=auth)
+    check("malformed payload -> 200 ignored", r.status_code == 200, r.text)
+
+
+with TestClient(main.app) as client:
+    # Swap the real OXS transport for the mock.
+    main.app.state.oxs._http = httpx.AsyncClient(
+        base_url="https://api.oxs.co.il/api/external/v1",
+        transport=httpx.MockTransport(oxs_mock),
+    )
+
+    r = client.get("/health")
+    check("health ok + configured", r.status_code == 200 and r.json()["configured"] is True, r.text)
+
+    if PROVIDER == "meta":
+        run_meta_suite(client)
+    else:
+        run_greenapi_suite(client)
+
 print()
 if failures:
-    print(f"SMOKE FAILED: {len(failures)} failing check(s): {failures}")
+    print(f"SMOKE FAILED ({PROVIDER}): {len(failures)} failing check(s): {failures}")
     raise SystemExit(1)
-print("SMOKE PASSED: all checks green")
+print(f"SMOKE PASSED ({PROVIDER}): all checks green")
+
+if PROVIDER == "meta":
+    print("\n--- re-running with SMOKE_PROVIDER=greenapi ---\n")
+    result = subprocess.run(
+        [sys.executable, __file__],
+        env={**os.environ, "SMOKE_PROVIDER": "greenapi"},
+    )
+    raise SystemExit(result.returncode)

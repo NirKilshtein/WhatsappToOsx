@@ -94,90 +94,81 @@ class WebhookPayload(_Base):
 
 
 # --------------------------------------------------------------------------
-# Green API WhatsApp webhook payload models
-# https://green-api.com/en/docs/
+# Green API webhook payload (incomingMessageReceived)
+# https://green-api.com/en/docs/api/receiving/notifications-format/incoming-message/Webhook-IncomingMessageReceived/
+#
+# Unlike Meta's nested batches, Green API POSTs ONE flat notification object
+# per message. incoming_messages() converts it to the internal WhatsAppMessage
+# so the rest of the flow stays provider-agnostic.
 # --------------------------------------------------------------------------
 
-class GreenApiMessage(_Base):
-    """Green API message event (incoming message)."""
-    messageId: str = ""
-    textMessage: Optional[str] = None
-    extendedTextMessage: Optional[dict[str, Any]] = None
-    
-    def get_message_id(self) -> str:
-        return self.messageId
-    
-    def get_message_text(self) -> str:
-        # Try simple text message first
-        if self.textMessage:
-            return self.textMessage.strip()
-        # Try extended text message
-        if self.extendedTextMessage:
-            text = self.extendedTextMessage.get("text", "").strip()
-            if text:
-                return text
-        return ""
+class GreenApiInstanceData(_Base):
+    idInstance: int = 0
+    wid: str = ""
+    typeInstance: str = ""
 
 
 class GreenApiSenderData(_Base):
-    """Green API sender data."""
-    senderJid: str = ""  # e.g., "972501234567@s.whatsapp.net" or "972501234567@c.us"
+    chatId: str = ""
+    sender: str = ""  # e.g. "972501234567@c.us"
+    chatName: str = ""
     senderName: str = ""
     senderContactName: str = ""
 
 
-class GreenApiInstanceData(_Base):
-    """Green API instance data containing messages."""
-    messages: list[GreenApiMessage] = []
+class GreenApiTextMessageData(_Base):
+    textMessage: str = ""
 
 
-class GreenApiData(_Base):
-    """Green API data payload."""
-    typeWebhook: str = ""
-    instanceData: Optional[GreenApiInstanceData] = None
-    senderData: Optional[GreenApiSenderData] = None
+class GreenApiExtendedTextMessageData(_Base):
+    text: str = ""
+
+
+class GreenApiMessageData(_Base):
+    typeMessage: str = ""
+    textMessageData: Optional[GreenApiTextMessageData] = None
+    extendedTextMessageData: Optional[GreenApiExtendedTextMessageData] = None
 
 
 class GreenApiWebhookPayload(_Base):
-    """Green API webhook payload wrapper."""
-    data: Optional[GreenApiData] = None
-    
+    typeWebhook: str = ""
+    instanceData: GreenApiInstanceData = GreenApiInstanceData()
+    timestamp: int = 0
+    idMessage: str = ""
+    senderData: GreenApiSenderData = GreenApiSenderData()
+    messageData: GreenApiMessageData = GreenApiMessageData()
+
+    def _text(self) -> str:
+        data = self.messageData
+        if data.textMessageData and data.textMessageData.textMessage:
+            return data.textMessageData.textMessage.strip()
+        if data.extendedTextMessageData and data.extendedTextMessageData.text:
+            return data.extendedTextMessageData.text.strip()
+        return ""
+
     def incoming_messages(self) -> list[tuple[WhatsAppMessage, str]]:
-        """Convert Green API messages to WhatsAppMessage format for compatibility."""
-        result: list[tuple[WhatsAppMessage, str]] = []
-        if not self.data or not self.data.instanceData:
-            return result
-        
-        # Extract sender information
-        sender_phone = ""
-        sender_name = ""
-        
-        if self.data.senderData:
-            # Extract phone from senderJid (format: "972501234567@s.whatsapp.net" or "972501234567@c.us")
-            jid = self.data.senderData.senderJid
-            if jid:
-                # Remove the domain part (@s.whatsapp.net or @c.us)
-                sender_phone = jid.split("@")[0] if "@" in jid else jid
-            sender_name = (
-                self.data.senderData.senderContactName or 
-                self.data.senderData.senderName or 
-                ""
-            )
-        
-        for msg in self.data.instanceData.messages:
-            text = msg.get_message_text()
-            if text and sender_phone:
-                # Create a compatible WhatsAppMessage
-                wa_msg = WhatsAppMessage(
-                    id=msg.get_message_id(),
-                    from_number=sender_phone,
-                    timestamp="",
-                    type="text",
-                    text=WhatsAppText(body=text)
-                )
-                result.append((wa_msg, sender_name))
-        
-        return result
+        """One (message, sender_display_name) pair, or [] for anything that is
+        not an incoming text (statuses, outgoing echoes, media without text)."""
+        if self.typeWebhook != "incomingMessageReceived":
+            return []
+        sender_jid = self.senderData.sender or self.senderData.chatId
+        sender_phone = sender_jid.split("@", 1)[0] if sender_jid else ""
+        text = self._text()
+        if not sender_phone or not text:
+            return []
+        name = (
+            self.senderData.senderContactName
+            or self.senderData.senderName
+            or self.senderData.chatName
+        )
+        message = WhatsAppMessage.model_validate({
+            "id": self.idMessage,
+            "from": sender_phone,
+            "timestamp": str(self.timestamp or ""),
+            "type": "text",
+            "text": {"body": text},
+        })
+        return [(message, name)]
 
 
 # --------------------------------------------------------------------------

@@ -3,4 +3,3 @@
 __pycache__/
 *.pyc
 app.zip
-.env.example

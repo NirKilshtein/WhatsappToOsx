@@ -1,6 +1,9 @@
 """OXS WhatsApp Bridge — FastAPI application.
 
-Supports both Meta WhatsApp Cloud API and Green API webhooks.
+Supports two inbound providers, selected with WHATSAPP_PROVIDER:
+  meta      — Meta WhatsApp Cloud API webhooks (X-Hub-Signature-256, fail closed)
+  greenapi  — Green API webhooks (Authorization header must match
+              GREENAPI_WEBHOOK_TOKEN / the instance's webhookUrlToken, fail closed)
 
 Flow per incoming WhatsApp message:
   1. webhook.received      — payload parsed & signature-verified (fail closed)
@@ -8,14 +11,12 @@ Flow per incoming WhatsApp message:
   3. match.*               — tenant located via OXS buildings/tenants (General key)
   4. service_call.created  — POST /service-calls with the Service Calls key
 
-Providers expect a fast 200 on the webhook and retry on timeouts, so OXS work
+Meta expects a fast 200 on the webhook and retries on timeouts, so OXS work
 runs on a single background worker fed by an asyncio.Queue — the handler only
-enqueues and returns, so slow OXS calls never block webhook delivery connections,
-and OXS access is naturally serialized. Message IDs are deduplicated in memory
-(providers re-deliver on retry); a message whose processing FAILS is un-marked
-so redelivery gets a second chance.
-
-Set WHATSAPP_PROVIDER to "meta" or "greenapi" to select the webhook source.
+enqueues and returns, so slow OXS calls never block Meta's keep-alive
+connections, and OXS access is naturally serialized. Message IDs are
+deduplicated in memory (Meta re-delivers on retry); a message whose processing
+FAILS is un-marked so Meta's redelivery gets a second chance.
 """
 
 import asyncio
@@ -26,15 +27,14 @@ import re
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import ValidationError
 
 from config import get_settings
-from models import WebhookPayload, WhatsAppMessage, GreenApiWebhookPayload
 from message_classifier import classify_message
+from models import GreenApiWebhookPayload, WebhookPayload, WhatsAppMessage
 from oxs_service import OxsClient, OxsError
 from phone_utils import normalize_phone
 
@@ -130,29 +130,22 @@ async def verify_webhook(
     hub_verify_token: str = Query("", alias="hub.verify_token"),
     hub_challenge: str = Query("", alias="hub.challenge"),
 ) -> PlainTextResponse:
-    """Webhook subscription handshake (Meta) or health check (Green API)."""
-    # Meta webhook subscription handshake
-    if settings.whatsapp_provider == "meta":
-        if (
-            hub_mode == "subscribe"
-            and settings.meta_verify_token
-            and hmac.compare_digest(
-                hub_verify_token.encode("utf-8", "replace"),
-                settings.meta_verify_token.encode("utf-8", "replace"),
-            )
-        ):
-            log.info("event=webhook.verified provider=meta")
-            return PlainTextResponse(hub_challenge)
-        log.warning("event=webhook.verify_rejected provider=meta mode=%r", hub_mode)
-        raise HTTPException(status_code=403, detail="Verification failed")
-    
-    # Green API doesn't require GET verification, just return OK
-    elif settings.whatsapp_provider == "greenapi":
-        log.info("event=webhook.verify_health provider=greenapi")
+    """Meta webhook subscription handshake, or a plain liveness OK for Green API."""
+    if settings.whatsapp_provider == "greenapi":
+        # Green API has no GET handshake; answer OK for dashboards/health checks.
         return PlainTextResponse("OK")
-    
-    log.warning("event=webhook.verify_rejected unknown_provider=%s", settings.whatsapp_provider)
-    raise HTTPException(status_code=403, detail="Unknown provider")
+    if (
+        hub_mode == "subscribe"
+        and settings.meta_verify_token
+        and hmac.compare_digest(
+            hub_verify_token.encode("utf-8", "replace"),
+            settings.meta_verify_token.encode("utf-8", "replace"),
+        )
+    ):
+        log.info("event=webhook.verified")
+        return PlainTextResponse(hub_challenge)
+    log.warning("event=webhook.verify_rejected mode=%r", hub_mode)
+    raise HTTPException(status_code=403, detail="Verification failed")
 
 
 @app.post("/webhook")
@@ -164,13 +157,26 @@ async def receive_webhook(request: Request) -> dict:
     if len(raw) > _MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="Payload too large")
 
-    # Validate signature based on provider
-    is_valid, provider = _validate_webhook_signature(raw, request)
-    if not is_valid:
-        log.warning("event=webhook.bad_signature provider=%s", provider)
-        raise HTTPException(status_code=403, detail="Invalid signature")
-    
-    if provider == "meta" and not settings.meta_app_secret and not settings.allow_unsigned_webhooks:
+    if settings.whatsapp_provider == "greenapi":
+        outcome = _greenapi_authorized(request)
+        if outcome == "forbidden":
+            log.warning("event=webhook.bad_token provider=greenapi")
+            raise HTTPException(status_code=403, detail="Invalid webhook token")
+        if outcome == "ignored":
+            # Fail closed, same reasoning as the Meta path below.
+            log.warning(
+                "event=webhook.unsigned_ignored provider=greenapi "
+                "hint=set_GREENAPI_WEBHOOK_TOKEN (and set the instance's "
+                "webhookUrlToken to the same value), or "
+                "ALLOW_UNSIGNED_WEBHOOKS=true for local development only"
+            )
+            return {"status": "ignored_unsigned"}
+    elif settings.meta_app_secret:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not _valid_signature(raw, signature, settings.meta_app_secret):
+            log.warning("event=webhook.bad_signature")
+            raise HTTPException(status_code=403, detail="Invalid signature")
+    elif not settings.allow_unsigned_webhooks:
         # Fail closed: without META_APP_SECRET anyone could forge messages and
         # open bogus service calls. ACK (so Meta stops retrying) but do nothing.
         log.warning(
@@ -179,56 +185,62 @@ async def receive_webhook(request: Request) -> dict:
         )
         return {"status": "ignored_unsigned"}
 
-    # Parse payload based on provider
-    payload = _parse_webhook_payload(raw, provider)
+    payload = _parse_payload(raw)
     if payload is None:
-        # 200 on malformed payloads so providers stop retrying
+        # 200 on malformed payloads: providers would otherwise retry them forever.
         return {"status": "ignored"}
+
+    if settings.whatsapp_provider == "greenapi":
+        expected_instance = settings.greenapi_numeric_instance_id()
+        if expected_instance and str(payload.instanceData.idInstance) != expected_instance:
+            log.warning(
+                "event=webhook.wrong_instance got=%s", payload.instanceData.idInstance
+            )
+            return {"status": "ignored"}
 
     accepted = 0
     for message, sender_name in payload.incoming_messages():
         if accepted >= _MAX_MESSAGES_PER_POST:
-            log.warning("event=webhook.message_cap cap=%d provider=%s", _MAX_MESSAGES_PER_POST, provider)
+            log.warning("event=webhook.message_cap cap=%d", _MAX_MESSAGES_PER_POST)
             break
         if not message.id or not message.from_number:
-            log.warning("event=message.skipped reason=missing_id_or_sender provider=%s", provider)
+            log.warning("event=message.skipped reason=missing_id_or_sender")
             continue
         if _already_processed(message.id):
-            log.info("event=message.duplicate message_id=%s provider=%s", message.id, provider)
+            log.info("event=message.duplicate message_id=%s", message.id)
             continue
 
         text = _sanitize_text(message.body_text())
         if not text:
             log.info(
-                "event=message.skipped reason=no_text type=%s message_id=%s provider=%s",
-                message.type, message.id, provider,
+                "event=message.skipped reason=no_text type=%s message_id=%s",
+                message.type, message.id,
             )
             continue
         classification = classify_message(text)
         if classification.category != "maintenance_request":
             log.info(
-                "event=message.skipped reason=no_maintenance_keyword category=%s "
-                "message_id=%s provider=%s",
-                classification.category, message.id, provider,
+                "event=message.skipped reason=not_maintenance category=%s message_id=%s",
+                classification.category, message.id,
             )
             continue
         if _sender_over_limit(message.from_number):
             # Stays marked as seen on purpose — a flood shouldn't come back.
             log.warning(
-                "event=message.sender_rate_limited from=%s message_id=%s provider=%s",
-                message.from_number, message.id, provider,
+                "event=message.sender_rate_limited from=%s message_id=%s",
+                message.from_number, message.id,
             )
             continue
 
         try:
             request.app.state.queue.put_nowait((message, sender_name, text))
         except asyncio.QueueFull:
-            _forget_message(message.id)  # let provider redeliver once there's room
-            log.warning("event=message.queue_full message_id=%s provider=%s", message.id, provider)
+            _forget_message(message.id)  # let Meta redeliver once there's room
+            log.warning("event=message.queue_full message_id=%s", message.id)
             continue
         log.info(
-            "event=message.accepted message_id=%s from=%s name=%r chars=%d provider=%s",
-            message.id, message.from_number, sender_name, len(text), provider,
+            "event=message.accepted message_id=%s from=%s name=%r chars=%d",
+            message.id, message.from_number, sender_name, len(text),
         )
         accepted += 1
 
@@ -296,10 +308,8 @@ async def process_message(
         )
         return
     log.info(
-        "event=flow.done message_id=%s category=%s matched_terms=%s building=%r "
-        "apartment_id=%s service_call_id=%s",
-        message.id, classification.category, matched_terms, match.building_name,
-        match.apartment_id, call_id,
+        "event=flow.done message_id=%s building=%r apartment_id=%s service_call_id=%s",
+        message.id, match.building_name, match.apartment_id, call_id,
     )
 
 
@@ -319,59 +329,44 @@ def _display_phone(sender: str) -> str:
     return f"0{core}" if core else sender
 
 
+def _greenapi_authorized(request: Request) -> str:
+    """'ok' | 'ignored' (no token configured) | 'forbidden' (token mismatch).
+
+    Green API sends the instance's webhookUrlToken in the Authorization header;
+    depending on version it arrives raw or prefixed with Bearer/Basic.
+    """
+    token = settings.greenapi_webhook_token
+    if not token:
+        return "ok" if settings.allow_unsigned_webhooks else "ignored"
+    header = request.headers.get("Authorization", "")
+    expected = token.encode()
+    candidates = (header, header.removeprefix("Bearer "), header.removeprefix("Basic "))
+    for candidate in candidates:
+        if hmac.compare_digest(candidate.encode("utf-8", "replace"), expected):
+            return "ok"
+    return "forbidden"
+
+
+def _parse_payload(raw: bytes) -> GreenApiWebhookPayload | WebhookPayload | None:
+    model = (
+        GreenApiWebhookPayload
+        if settings.whatsapp_provider == "greenapi"
+        else WebhookPayload
+    )
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError as exc:
+        log.warning(
+            "event=webhook.invalid_payload provider=%s error=%s",
+            settings.whatsapp_provider,
+            str(exc).replace("\n", " | ")[:300],
+        )
+        return None
+
+
 def _valid_signature(raw_body: bytes, header_value: str, app_secret: str) -> bool:
     if not header_value.startswith("sha256="):
         return False
     expected = hmac.new(app_secret.encode(), raw_body, hashlib.sha256).hexdigest().encode()
     provided = header_value[len("sha256="):].encode("utf-8", "replace")
     return hmac.compare_digest(provided, expected)
-
-
-def _validate_webhook_signature(
-    raw_body: bytes, request: Request
-) -> tuple[bool, str]:
-    """Validate webhook signature based on configured provider.
-    
-    Returns (is_valid, provider_name).
-    """
-    if settings.whatsapp_provider == "greenapi":
-        # Green API validation - can be via header API key or signature
-        # For now, accept all unsigned webhooks from Green API 
-        # (production should verify IP whitelist and/or signature)
-        api_key = request.headers.get("X-API-Key", "")
-        if api_key == settings.greenapi_api_key:
-            return True, "greenapi"
-        # Allow unsigned for now (can be configured)
-        return True, "greenapi"
-    else:
-        # Meta validation
-        if settings.meta_app_secret:
-            signature = request.headers.get("X-Hub-Signature-256", "")
-            if not _valid_signature(raw_body, signature, settings.meta_app_secret):
-                return False, "meta"
-        elif not settings.allow_unsigned_webhooks:
-            return False, "meta"
-        return True, "meta"
-
-
-def _parse_webhook_payload(raw: bytes, provider: str) -> Optional[Any]:
-    """Parse webhook payload based on provider type."""
-    try:
-        if provider == "greenapi":
-            payload = GreenApiWebhookPayload.model_validate_json(raw)
-            return payload
-        else:
-            payload = WebhookPayload.model_validate_json(raw)
-            return payload
-    except ValidationError as exc:
-        log.warning(
-            "event=webhook.invalid_payload provider=%s error=%s",
-            provider,
-            str(exc).replace("\n", " | ")[:300],
-        )
-        return None
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
