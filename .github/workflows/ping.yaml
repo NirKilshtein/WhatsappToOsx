@@ -1,0 +1,10 @@
+name: Keep Render Alive
+on:
+  schedule:
+    - cron: '*/10 * * * *' # רץ כל 10 דקות
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping App
+        run: curl -s "https://whatsapptoosx.onrender.com/webhook"
