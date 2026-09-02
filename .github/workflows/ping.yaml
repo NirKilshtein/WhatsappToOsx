@@ -1,7 +1,9 @@
 name: Keep Render Alive
 on:
+  workflow_dispatch: # מאפשר הרצה ידנית מתוך GitHub
   schedule:
-    - cron: '*/10 * * * *' # רץ כל 10 דקות
+    - cron: '*/10 * * * *'
+
 jobs:
   ping:
     runs-on: ubuntu-latest
